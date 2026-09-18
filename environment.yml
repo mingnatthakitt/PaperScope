@@ -1,0 +1,26 @@
+name: PaperScope
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pymupdf
+  - pillow
+  - pydantic>=2.7
+  - fastapi>=0.115
+  - uvicorn>=0.30
+  - sqlalchemy>=2.0
+  - psycopg>=3.2
+  - httpx>=0.27
+  - python-multipart>=0.0.9
+  - python-dotenv>=1.0
+  - tenacity>=9.0
+  - pytest>=8.0
+  - pytest-asyncio>=0.24
+  - ruff>=0.8
+  - pip:
+      - google-genai>=1.0
+      - openai>=1.50
+      - pgvector>=0.3
+      - sentence-transformers>=3.3
+      - torch>=2.5

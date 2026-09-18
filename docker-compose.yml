@@ -1,0 +1,70 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: paperscope
+      POSTGRES_USER: paperscope
+      POSTGRES_PASSWORD: paperscope
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - paperscope_postgres:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperscope -d paperscope"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    profiles: ["full"]
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://paperscope:paperscope@db:5432/paperscope
+      PAPERS_ROOT: /data/papers
+      EMBEDDING_DEVICE: cpu
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data/papers:/data/papers
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: uvicorn paperscope.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    profiles: ["full"]
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://paperscope:paperscope@db:5432/paperscope
+      PAPERS_ROOT: /data/papers
+      EMBEDDING_DEVICE: cpu
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data/papers:/data/papers
+    command: python -m paperscope.worker
+
+  web:
+    profiles: ["full"]
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  paperscope_postgres:

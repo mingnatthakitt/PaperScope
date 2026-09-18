@@ -1,0 +1,15 @@
+{
+  "name": "paperscope",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "dev": "pnpm --filter @paperscope/web dev",
+    "build": "pnpm --filter @paperscope/web build",
+    "lint": "pnpm --filter @paperscope/web lint",
+    "typecheck": "pnpm --filter @paperscope/web typecheck"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22"
+  }
+}

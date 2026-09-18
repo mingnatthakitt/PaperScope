@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["**/._*"]
+
+[tool.ruff.lint]
+ignore = ["B008", "BLE001", "EXE002"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
