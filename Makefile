@@ -10,7 +10,7 @@ worker:
 	cd services/backend && conda run -n PaperScope python -m paperscope.worker
 
 web:
-	pnpm --filter @paperscope/web dev
+	pnpm --filter @paperscope/web exec next dev --webpack --hostname 127.0.0.1
 
 test:
 	cd services/backend && conda run -n PaperScope python -m pytest tests

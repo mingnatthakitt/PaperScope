@@ -16,7 +16,13 @@ class CamelModel(BaseModel):
 
 
 ExplanationLevel = Literal["simple", "student", "researcher"]
-AnalysisModel = Literal["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]
+AnalysisModel = Literal[
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
+AnswerModel = Literal["muse", "nemotron", "gemma"]
 VisualType = Literal["architecture", "diagram", "plot", "chart", "table", "algorithm", "equation", "other"]
 GraphNodeType = Literal["input", "component", "process", "decision", "concept", "result", "baseline", "proposed"]
 
@@ -286,4 +292,5 @@ class RAGRequest(CamelModel):
     paper_ids: list[UUID] = Field(min_length=1, max_length=3)
     question: str = Field(min_length=3, max_length=2000)
     explanation_level: ExplanationLevel = "student"
+    answer_model: AnswerModel = "muse"
     history: list[ConversationTurn] = Field(default_factory=list, max_length=12)

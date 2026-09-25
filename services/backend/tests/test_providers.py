@@ -61,9 +61,29 @@ def test_gemini_model_chain_is_ordered_from_newest_to_oldest() -> None:
         "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemma-4-31b-it",
     )
-    assert analysis_model_chain("gemini-3.7-flash") == ("gemini-3.7-flash", "gemini-3.6-flash")
-    assert analysis_model_chain("gemini-3.6-flash") == ("gemini-3.6-flash",)
+    assert analysis_model_chain("gemini-3.7-flash") == (
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemma-4-31b-it",
+    )
+    assert analysis_model_chain("gemini-3.6-flash") == ("gemini-3.6-flash", "gemini-3.5-flash", "gemma-4-31b-it")
+    assert analysis_model_chain("gemini-3.5-flash") == ("gemini-3.5-flash", "gemma-4-31b-it")
+
+
+def test_api_schemas_accept_flash_3_5_and_default_answers_to_muse() -> None:
+    from paperscope.schemas import IngestSource, RAGRequest
+
+    ingest = IngestSource(sourceUrl="https://arxiv.org/abs/2601.12345", analysisModel="gemini-3.5-flash")
+    ask = RAGRequest(paperIds=[uuid4()], question="What is the main result?")
+    gemma = RAGRequest(paperIds=[uuid4()], question="What is the main result?", answerModel="gemma")
+
+    assert ingest.analysis_model == "gemini-3.5-flash"
+    assert ask.answer_model == "muse"
+    assert gemma.answer_model == "gemma"
 
 
 @pytest.mark.asyncio
@@ -160,3 +180,64 @@ async def test_gemini_reuses_one_uploaded_file_across_model_retries(monkeypatch,
         "gemini-3.7-flash",
         "gemini-3.6-flash",
     ]
+
+
+@pytest.mark.asyncio
+async def test_gemini_falls_through_all_flash_models_to_gemma(monkeypatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+    expected_analysis = object()
+
+    class FakeGemma:
+        def __init__(self, model):
+            assert model == "gemma-4-31b-it"
+
+        async def analyze_pages(self, pages, images, cache_dir, retries, progress_callback):
+            calls.append("gemma-4-31b-it")
+            assert pages and images and cache_dir
+            return expected_analysis
+
+    provider = object.__new__(GeminiDocumentAnalysisProvider)
+    provider.requested_model = "gemini-3.8-flash"
+    provider.model_chain = analysis_model_chain(provider.requested_model)
+    provider.model_used = provider.model_chain[0]
+    provider._gemini_client = None
+    provider._uploaded_file = None
+
+    def fail_flash(_pdf_path: Path, model: str):
+        calls.append(model)
+        raise RetryableProviderError(f"{model} unavailable")
+
+    monkeypatch.setattr(provider, "_analyze_sync", fail_flash)
+    monkeypatch.setattr(
+        "paperscope.providers.gemini.settings",
+        SimpleNamespace(gemini_model_max_retries=2, gemma_analysis_max_retries=2),
+    )
+    monkeypatch.setattr("paperscope.providers.gemini.GemmaDocumentAnalysisProvider", FakeGemma)
+    pages = [SimpleNamespace(page_number=1, text="page text")]
+    images = {1: tmp_path / "page.webp"}
+    cache_dir = tmp_path / "cache"
+
+    result = await provider.analyze_pdf(
+        tmp_path / "paper.pdf",
+        pages=pages,
+        page_images=images,
+        batch_cache_dir=cache_dir,
+    )
+
+    assert result is expected_analysis
+    assert calls == [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.7-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.6-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash",
+        "gemma-4-31b-it",
+    ]
+    assert provider.model_used == "gemma-4-31b-it"

@@ -19,6 +19,26 @@ PaperScope is currently an early-stage, single-user project intended to run on a
 - Answers follow-up questions in a browser-persisted chat with paper and page citations.
 - Compares up to three papers while preserving paper attribution.
 
+## Screenshots
+
+The paper, concept graph, and comparison views below use PaperScope's built-in sample content to demonstrate the interface; they are not live model responses or locally ingested papers.
+
+<p align="center">
+  <img src="docs/screenshots/home.png" alt="PaperScope home screen" width="100%" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/paper-workspace.png" alt="PaperScope paper workspace with Ask Paper chat and answer-model selection" width="100%" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/concept-graph.png" alt="PaperScope paper concept graph" width="100%" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/compare.png" alt="PaperScope multi-paper comparison with answer-model selection" width="100%" />
+</p>
+
 ## Architecture
 
 ```mermaid
@@ -41,10 +61,10 @@ The recommended Apple Silicon setup runs PostgreSQL in Docker while the API, wor
 - macOS or Linux
 - Docker with Docker Compose
 - Node.js 22
-- pnpm 11.19 or newer
+- Corepack, which provides the project-pinned pnpm version
 - Conda or Miniforge
 - A Gemini API key for paper analysis
-- An NVIDIA API key for RAG answers and optional discovery reranking
+- An NVIDIA API key for Muse/Nemotron answers and optional discovery reranking (Gemma 4 can answer with the Google AI key)
 - Optional: a Semantic Scholar API key. Search still works through arXiv without one.
 
 The default local embedding model is `Qwen/Qwen3-Embedding-0.6B`. Its first use downloads model weights, so startup and the first ingestion can take longer than later runs.
@@ -71,9 +91,12 @@ SEMANTIC_SCHOLAR_API_KEY=
 
 ```bash
 conda env create -f environment.yml
-corepack enable
+corepack enable pnpm
+pnpm --version
 pnpm install --frozen-lockfile
 ```
+
+The repository pins pnpm 11.19.0 in `package.json`; Corepack selects that version when you run pnpm from this project. If `corepack` itself is missing, install it with `npm install --global corepack`, then rerun `corepack enable pnpm`. If the shim cannot be added to your Node installation, use `corepack pnpm install --frozen-lockfile` for dependency installation.
 
 If the `PaperScope` Conda environment already exists, update it instead:
 
@@ -138,13 +161,13 @@ docker compose --profile full down
 4. Open the paper workspace to switch between Simple, Student, Researcher, Visual, Graph, and Ask Paper views.
 5. Ask follow-up questions in the chat. Text questions use retrieved embeddings; visual questions also attach the relevant page or crop to the model.
 
-New ingestions default to Gemini Flash 3.8. Retryable failures follow the configured model chain:
+New ingestions default to Gemini Flash 3.8. Retryable failures follow the selected model chain, descending through the available Gemini Flash versions and ending with Gemma 4. Gemini analyzes the original PDF natively; the Gemma fallback analyzes extracted, page-numbered text plus compressed local page images in resumable batches. Qwen embeddings run after either analysis path.
 
 ```text
-Gemini Flash 3.8 -> Gemini Flash 3.7 -> Gemini Flash 3.6
+Gemini Flash 3.8 -> Gemini Flash 3.7 -> Gemini Flash 3.6 -> Gemini Flash 3.5 -> Gemma 4
 ```
 
-RAG requests use Muse Glimmer first and then the configured Nemotron fallback. Exact provider model IDs and availability depend on the connected accounts and can be changed in `.env`.
+Ask Paper and Compare share an answer-model choice saved in browser storage. The chosen provider is attempted first, followed by the remaining providers in Muse Glimmer → Nemotron → Gemma 4 order. Providers without their required API key are skipped. The 60-second RAG request limit is shared across retries and fallbacks; each answer receives the same retrieved evidence, chat history, and relevant page images.
 
 ## Configuration
 
@@ -157,10 +180,14 @@ The complete development template is in [`.env.example`](.env.example). Importan
 | `GOOGLE_AI_API_KEY` | Gemini document analysis credential | Required for ingestion |
 | `PAPER_ANALYSIS_MODEL` | Preferred Gemini indexing model | `gemini-3.8-flash` |
 | `GEMINI_MODEL_MAX_RETRIES` | Additional attempts per Gemini model | `2` |
-| `NVIDIA_API_KEY` | NVIDIA NIM credential | Required for RAG answers |
+| `GEMMA_ANALYSIS_MAX_RETRIES` | Additional attempts per Gemma indexing batch/final analysis | `2` |
+| `GEMMA_ANALYSIS_PROMPT_VERSION` | Cache version for the Gemma indexing fallback | `gemma-pages-v1` |
+| `NVIDIA_API_KEY` | NVIDIA NIM credential | Required for Muse/Nemotron answers |
 | `NIM_BASE_URL` | OpenAI-compatible NIM endpoint | NVIDIA hosted API |
 | `RAG_PRIMARY_MODEL` | Primary answer model | Muse Glimmer |
 | `RAG_FALLBACK_MODEL` | Fallback answer model | Nemotron |
+| `RAG_GEMMA_MODEL` | Gemma RAG answer model | `gemma-4-31b-it` |
+| `RAG_GEMMA_MAX_RETRIES` | Additional attempts for Gemma RAG answers | `1` |
 | `RAG_PROVIDER_TIMEOUT_SECONDS` | Timeout for each provider attempt | `18` |
 | `EMBEDDING_MODEL` | Local sentence-transformer model | Qwen3 0.6B |
 | `EMBEDDING_DEVICE` | Embedding device selection | `auto` |
@@ -173,7 +200,7 @@ Retry settings count additional retries. For example, a value of `2` allows up t
 
 - Original PDFs, page images, and derived assets are stored under `data/papers/` and are excluded from Git.
 - PostgreSQL data lives in a named Docker volume and is excluded from Git.
-- Gemini receives the original PDF during ingestion for native document analysis.
+- Google AI receives the original PDF for native Gemini analysis, or extracted text and rendered page images in bounded batches if Gemma indexing fallback is needed.
 - NVIDIA NIM receives retrieved evidence and only receives page images when visual evidence is needed.
 - Qwen embeddings run locally on MPS, CUDA, or CPU.
 - Provider credentials remain in the backend environment and are never sent to the browser.

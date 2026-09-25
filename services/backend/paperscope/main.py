@@ -317,7 +317,7 @@ async def ingest_paper(
         candidate_analysis_model = form.get("analysisModel") or form.get("analysis_model")
         if candidate_analysis_model is not None:
             if not isinstance(candidate_analysis_model, str) or candidate_analysis_model not in ANALYSIS_MODEL_FALLBACKS:
-                raise HTTPException(status_code=400, detail="analysisModel must be one of the supported Gemini Flash models")
+                raise HTTPException(status_code=400, detail="analysisModel must be one of the supported indexing models")
             analysis_model = candidate_analysis_model
         metadata = {**metadata, "analysisModel": analysis_model}
     elif content_type:

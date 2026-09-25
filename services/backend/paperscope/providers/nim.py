@@ -31,7 +31,7 @@ def _status_code(error: Exception) -> str:
 def _retryable_nim_error(error: Exception) -> bool:
     status = _status_code(error)
     message = str(error).lower()
-    return status in {"429", "500", "502", "503", "504"} or any(
+    return status in {"408", "429", "500", "502", "503", "504"} or any(
         marker in message
         for marker in (
             "timeout",

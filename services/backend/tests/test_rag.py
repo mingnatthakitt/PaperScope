@@ -1,14 +1,51 @@
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from paperscope.models.tables import PaperPage, PaperVisual
-from paperscope.providers.contracts import RetryableProviderError
+from paperscope.providers.contracts import ProviderConfigurationError, RetryableProviderError
 from paperscope.rag.context import build_multimodal_context, resolve_images, should_attach_images
 from paperscope.rag.retrieval import retrieve_all
 from paperscope.rag.service import CircuitBreaker, RagService
 from paperscope.schemas import ConversationTurn, RAGAnswer, RAGModelInput, RAGRequest, RetrievedContext
+
+
+@pytest.fixture
+def rag_test_settings(monkeypatch):
+    test_settings = SimpleNamespace(
+        nvidia_api_key="test-nim-key",
+        google_ai_api_key="test-google-key",
+        rag_primary_max_retries=2,
+        rag_fallback_max_retries=2,
+        rag_gemma_max_retries=1,
+        rag_timeout_seconds=60,
+        rag_provider_timeout_seconds=18,
+        circuit_breaker_failures=3,
+        circuit_breaker_cooldown_seconds=90,
+    )
+    monkeypatch.setattr("paperscope.rag.service.settings", test_settings)
+    return test_settings
+
+
+def _rag_context(paper_id):
+    evidence = [
+        RetrievedContext(
+            id="raw-chunk",
+            paper_id=paper_id,
+            source_type="text",
+            content="The throughput curve plateaus after batch size 32.",
+            similarity=0.9,
+        )
+    ]
+    context = RAGModelInput(
+        question="Why does throughput flatten?",
+        history=[ConversationTurn(role="user", content="What does the plot show?")],
+        evidence=[evidence[0].model_copy(update={"id": "E1"})],
+        images=[{"id": "page:8", "type": "page", "pageNumber": 8, "base64": "image-data", "label": "Figure 5"}],
+    )
+    return evidence, context
 
 
 def test_evidence_gets_stable_public_citation_ids() -> None:
@@ -182,7 +219,7 @@ async def test_circuit_breaker_opens_after_failure_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rag_uses_nemotron_after_primary_failures(monkeypatch) -> None:
+async def test_rag_uses_nemotron_after_primary_failures(monkeypatch, rag_test_settings) -> None:
     paper_id = uuid4()
     evidence = [
         RetrievedContext(
@@ -201,14 +238,18 @@ async def test_rag_uses_nemotron_after_primary_failures(monkeypatch) -> None:
             return [1.0]
 
     class FailingMuse:
-        model = "muse-test"
+        def __init__(self, timeout_seconds=None):
+            self.model = "muse-test"
+            self.timeout_seconds = timeout_seconds
 
         async def answer(self, request: RAGModelInput) -> RAGAnswer:
             calls.append(self.model)
             raise RetryableProviderError("Muse unavailable")
 
     class WorkingNemotron:
-        model = "nemotron-test"
+        def __init__(self, timeout_seconds=None):
+            self.model = "nemotron-test"
+            self.timeout_seconds = timeout_seconds
 
         async def answer(self, request: RAGModelInput) -> RAGAnswer:
             calls.append(self.model)
@@ -235,11 +276,11 @@ async def test_rag_uses_nemotron_after_primary_failures(monkeypatch) -> None:
 
     assert result.model == "nemotron-test"
     assert result.fallback_used
-    assert calls[-1] == "nemotron-test"
+    assert calls == ["muse-test", "muse-test", "muse-test", "nemotron-test"]
 
 
 @pytest.mark.asyncio
-async def test_rag_uses_all_configured_nemotron_attempts(monkeypatch) -> None:
+async def test_rag_uses_all_configured_nemotron_attempts(monkeypatch, rag_test_settings) -> None:
     paper_id = uuid4()
     evidence = [RetrievedContext(id="E1", paper_id=paper_id, source_type="text", content="result", similarity=0.9)]
     context = RAGModelInput(question="What is the result?", evidence=evidence, images=[])
@@ -250,15 +291,19 @@ async def test_rag_uses_all_configured_nemotron_attempts(monkeypatch) -> None:
             return [1.0]
 
     class FailingMuse:
-        model = "muse-test"
+        def __init__(self, timeout_seconds=None):
+            self.model = "muse-test"
+            self.timeout_seconds = timeout_seconds
 
         async def answer(self, request: RAGModelInput) -> RAGAnswer:
             calls.append(self.model)
             raise RetryableProviderError("Muse unavailable")
 
     class NemotronWithTwoFailures:
-        model = "nemotron-test"
-        attempts = 0
+        def __init__(self, timeout_seconds=None):
+            self.model = "nemotron-test"
+            self.timeout_seconds = timeout_seconds
+            self.attempts = 0
 
         async def answer(self, request: RAGModelInput) -> RAGAnswer:
             calls.append(self.model)
@@ -272,20 +317,222 @@ async def test_rag_uses_all_configured_nemotron_attempts(monkeypatch) -> None:
     monkeypatch.setattr("paperscope.rag.service.NimMuseProvider", FailingMuse)
     monkeypatch.setattr("paperscope.rag.service.NimNemotronProvider", NemotronWithTwoFailures)
     service = RagService()
-    monkeypatch.setattr(
-        "paperscope.rag.service.settings",
-        SimpleNamespace(
-            rag_primary_max_retries=0,
-            rag_fallback_max_retries=2,
-            rag_timeout_seconds=10,
-            rag_provider_timeout_seconds=1,
-        ),
-    )
+    rag_test_settings.rag_primary_max_retries = 0
+    rag_test_settings.rag_fallback_max_retries = 2
+    rag_test_settings.rag_provider_timeout_seconds = 1
     service.embeddings = FakeEmbeddings()
     result = await service.answer(object(), RAGRequest(paperIds=[paper_id], question="What is the result?"))
 
     assert result.model == "nemotron-test"
     assert calls == ["muse-test", "nemotron-test", "nemotron-test", "nemotron-test"]
+
+
+@pytest.mark.parametrize(
+    ("preferred", "expected_order"),
+    [
+        ("muse", ["muse", "nemotron", "gemma"]),
+        ("nemotron", ["nemotron", "muse", "gemma"]),
+        ("gemma", ["gemma", "muse", "nemotron"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rag_selected_provider_runs_first_and_fallbacks_keep_the_same_request(
+    monkeypatch, rag_test_settings, preferred, expected_order
+) -> None:
+    paper_id = uuid4()
+    evidence, context = _rag_context(paper_id)
+    calls = []
+
+    class FakeEmbeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0]
+
+    class ScriptedProvider:
+        def __init__(self, key):
+            self.key = key
+            self.model = f"{key}-test"
+            self.timeout_seconds = None
+
+        async def answer(self, request: RAGModelInput) -> RAGAnswer:
+            calls.append((self.key, request))
+            if self.key != expected_order[-1]:
+                raise RetryableProviderError(f"{self.key} unavailable")
+            return RAGAnswer(answer="The curve plateaus after 32. [E1]", model=self.model, latency_ms=1)
+
+    monkeypatch.setattr("paperscope.rag.service.retrieve_all", lambda *_args: evidence)
+    monkeypatch.setattr("paperscope.rag.service.build_multimodal_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(
+        RagService,
+        "_provider",
+        staticmethod(lambda key, _timeout: ScriptedProvider(key)),
+    )
+    rag_test_settings.rag_primary_max_retries = 0
+    rag_test_settings.rag_fallback_max_retries = 0
+    rag_test_settings.rag_gemma_max_retries = 0
+    service = RagService()
+    service.embeddings = FakeEmbeddings()
+
+    result = await service.answer(
+        object(),
+        RAGRequest(paperIds=[paper_id], question="Why does throughput flatten?", answerModel=preferred),
+    )
+
+    assert [key for key, _request in calls] == expected_order
+    assert all(request is context for _key, request in calls)
+    assert result.model == f"{expected_order[-1]}-test"
+    assert result.fallback_used is True
+    assert result.grounded is True
+
+
+@pytest.mark.parametrize("preferred", ["muse", "nemotron", "gemma"])
+@pytest.mark.asyncio
+async def test_rag_stops_after_the_selected_provider_succeeds(monkeypatch, rag_test_settings, preferred) -> None:
+    paper_id = uuid4()
+    evidence, context = _rag_context(paper_id)
+    calls = []
+
+    class FakeEmbeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0]
+
+    class WorkingProvider:
+        def __init__(self, key):
+            self.model = f"{key}-test"
+            self.key = key
+            self.timeout_seconds = None
+
+        async def answer(self, request: RAGModelInput) -> RAGAnswer:
+            calls.append((self.key, request))
+            return RAGAnswer(answer="The evidence supports this. [E1]", model=self.model, latency_ms=1)
+
+    monkeypatch.setattr("paperscope.rag.service.retrieve_all", lambda *_args: evidence)
+    monkeypatch.setattr("paperscope.rag.service.build_multimodal_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(RagService, "_provider", staticmethod(lambda key, _timeout: WorkingProvider(key)))
+    service = RagService()
+    service.embeddings = FakeEmbeddings()
+
+    result = await service.answer(
+        object(),
+        RAGRequest(paperIds=[paper_id], question="Why does throughput flatten?", answerModel=preferred),
+    )
+
+    assert calls == [(preferred, context)]
+    assert result.model == f"{preferred}-test"
+    assert result.fallback_used is False
+    assert result.grounded is True
+
+
+@pytest.mark.asyncio
+async def test_rag_skips_providers_without_keys_and_uses_gemma_if_available(
+    monkeypatch, rag_test_settings
+) -> None:
+    paper_id = uuid4()
+    evidence, context = _rag_context(paper_id)
+    rag_test_settings.nvidia_api_key = None
+    calls = []
+
+    class FakeEmbeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0]
+
+    class GemmaOnly:
+        model = "gemma-test"
+        timeout_seconds = None
+
+        async def answer(self, request: RAGModelInput) -> RAGAnswer:
+            calls.append(request)
+            return RAGAnswer(answer="The evidence supports this. [E1]", model=self.model, latency_ms=1)
+
+    monkeypatch.setattr("paperscope.rag.service.retrieve_all", lambda *_args: evidence)
+    monkeypatch.setattr("paperscope.rag.service.build_multimodal_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(
+        RagService,
+        "_provider",
+        staticmethod(lambda key, _timeout: GemmaOnly() if key == "gemma" else pytest.fail(f"unexpected {key}")),
+    )
+    service = RagService()
+    service.embeddings = FakeEmbeddings()
+
+    result = await service.answer(
+        object(),
+        RAGRequest(paperIds=[paper_id], question="Why does throughput flatten?", answerModel="muse"),
+    )
+
+    assert calls == [context]
+    assert result.model == "gemma-test"
+    assert result.fallback_used is True
+
+
+@pytest.mark.asyncio
+async def test_rag_requires_at_least_one_provider_key(monkeypatch, rag_test_settings) -> None:
+    paper_id = uuid4()
+    evidence, context = _rag_context(paper_id)
+    rag_test_settings.nvidia_api_key = None
+    rag_test_settings.google_ai_api_key = None
+
+    class FakeEmbeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0]
+
+    monkeypatch.setattr("paperscope.rag.service.retrieve_all", lambda *_args: evidence)
+    monkeypatch.setattr("paperscope.rag.service.build_multimodal_context", lambda *_args, **_kwargs: context)
+    service = RagService()
+    service.embeddings = FakeEmbeddings()
+
+    with pytest.raises(ProviderConfigurationError, match="Configure NVIDIA_API_KEY or GOOGLE_AI_API_KEY"):
+        await service.answer(object(), RAGRequest(paperIds=[paper_id], question="Why does throughput flatten?"))
+
+
+@pytest.mark.asyncio
+async def test_rag_reserves_time_for_later_providers_and_honors_exhausted_deadline(
+    monkeypatch, rag_test_settings
+) -> None:
+    paper_id = uuid4()
+    evidence, context = _rag_context(paper_id)
+    rag_test_settings.rag_primary_max_retries = 0
+    rag_test_settings.rag_fallback_max_retries = 0
+    rag_test_settings.rag_gemma_max_retries = 0
+    provider_deadlines = []
+
+    class FakeEmbeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0]
+
+    async def exhaust_provider(self, provider, _request, deadline):
+        provider_deadlines.append((provider.model, deadline - time.monotonic()))
+        raise RetryableProviderError("simulated provider failure")
+
+    monkeypatch.setattr("paperscope.rag.service.retrieve_all", lambda *_args: evidence)
+    monkeypatch.setattr("paperscope.rag.service.build_multimodal_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(RagService, "_provider", staticmethod(lambda key, _timeout: SimpleNamespace(model=key)))
+    monkeypatch.setattr(RagService, "_answer_with_deadline", exhaust_provider)
+    service = RagService()
+    service.embeddings = FakeEmbeddings()
+
+    with pytest.raises(RetryableProviderError, match="All configured RAG providers failed"):
+        await service.answer(object(), RAGRequest(paperIds=[paper_id], question="Why does throughput flatten?"))
+
+    assert [model for model, _remaining in provider_deadlines] == ["muse", "nemotron", "gemma"]
+    assert provider_deadlines[1][1] > provider_deadlines[0][1] + 15
+    assert provider_deadlines[2][1] > provider_deadlines[1][1] + 15
+
+
+@pytest.mark.asyncio
+async def test_rag_does_not_start_a_provider_after_its_deadline(rag_test_settings) -> None:
+    paper_id = uuid4()
+    _evidence, context = _rag_context(paper_id)
+    touched = False
+
+    class NeverCalled:
+        model = "already-too-late"
+
+        async def answer(self, _request):
+            nonlocal touched
+            touched = True
+
+    with pytest.raises(RetryableProviderError, match="time budget exhausted"):
+        await RagService._answer_with_deadline(NeverCalled(), context, time.monotonic() - 1)
+    assert touched is False
 
 
 def test_retrieval_reserves_evidence_for_each_selected_paper(monkeypatch) -> None:

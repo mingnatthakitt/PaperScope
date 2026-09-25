@@ -4,14 +4,16 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from paperscope.config import analysis_model_chain, settings
+from paperscope.config import GEMMA_MODEL, analysis_model_chain, settings
 from paperscope.providers.contracts import (
     ProviderAttemptsExhaustedError,
     ProviderConfigurationError,
     RetryableProviderError,
 )
+from paperscope.providers.gemma import GemmaDocumentAnalysisProvider
 from paperscope.schemas import DeepPaperAnalysis
 
 ANALYSIS_PROMPT = """
@@ -46,7 +48,7 @@ def _retryable_provider_error(error: Exception) -> RetryableProviderError | None
         marker in message
         for marker in ("timeout", "server disconnected", "remoteprotocolerror", "connection reset", "connection aborted")
     )
-    if _status_code(error) in {"404", "429", "500", "502", "503", "504"} or transient_transport_error:
+    if _status_code(error) in {"404", "408", "429", "500", "502", "503", "504"} or transient_transport_error:
         return RetryableProviderError(str(error))
     return None
 
@@ -145,12 +147,52 @@ class GeminiDocumentAnalysisProvider:
         except (json.JSONDecodeError, ValueError) as exc:
             raise RetryableProviderError("Gemini returned an invalid analysis payload") from exc
 
-    async def analyze_pdf(self, pdf_path: Path) -> DeepPaperAnalysis:
+    async def analyze_pdf(
+        self,
+        pdf_path: Path,
+        *,
+        pages: list[object] | None = None,
+        page_images: dict[int, Path] | None = None,
+        batch_cache_dir: Path | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> DeepPaperAnalysis:
         last_error: RetryableProviderError | None = None
         self._gemini_client = None
         self._uploaded_file = None
         try:
             for model in self.model_chain:
+                if model == GEMMA_MODEL:
+                    if pages is None or page_images is None or batch_cache_dir is None:
+                        raise ProviderConfigurationError(
+                            "Gemma fallback requires extracted page text, rendered images, and a cache directory"
+                        )
+                    try:
+                        provider = GemmaDocumentAnalysisProvider(model=model)
+                        analysis = await provider.analyze_pages(
+                            pages,
+                            page_images,
+                            batch_cache_dir,
+                            settings.gemma_analysis_max_retries,
+                            progress_callback,
+                        )
+                        self.model_used = model
+                        logger.warning(
+                            "Paper analysis fell back from Gemini Flash to %s",
+                            model,
+                        )
+                        return analysis
+                    except ProviderConfigurationError:
+                        raise
+                    except RetryableProviderError as exc:
+                        last_error = exc
+                        logger.warning("Gemma paper analysis fallback failed")
+                    except Exception as exc:
+                        last_error = RetryableProviderError(
+                            f"Gemma paper analysis failed: {type(exc).__name__}"
+                        )
+                        logger.warning("Gemma paper analysis fallback failed: %s", type(exc).__name__)
+                    continue
+
                 for attempt in range(settings.gemini_model_max_retries + 1):
                     try:
                         analysis = await asyncio.to_thread(self._analyze_sync, pdf_path, model)
@@ -158,6 +200,8 @@ class GeminiDocumentAnalysisProvider:
                         if model != self.requested_model:
                             logger.warning("Gemini indexing fell back from %s to %s", self.requested_model, model)
                         return analysis
+                    except ProviderConfigurationError:
+                        raise
                     except RetryableProviderError as exc:
                         last_error = exc
                         logger.warning(
@@ -166,6 +210,15 @@ class GeminiDocumentAnalysisProvider:
                             attempt + 1,
                             settings.gemini_model_max_retries + 1,
                         )
+                    except Exception as exc:
+                        last_error = RetryableProviderError(
+                            f"Gemini Flash model {model} rejected the analysis request: {type(exc).__name__}"
+                        )
+                        logger.warning(
+                            "Gemini indexing model %s rejected the request; advancing to the next model",
+                            model,
+                        )
+                        break
         finally:
             self._gemini_client = None
             self._uploaded_file = None

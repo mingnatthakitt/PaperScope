@@ -5,24 +5,38 @@ export const ANALYSIS_MODELS = [
     id: "gemini-3.8-flash",
     label: "Gemini Flash 3.8",
     shortLabel: "Flash 3.8",
-    fallback: "3.7 → 3.6",
+    fallback: "3.7 → 3.6 → 3.5 → Gemma 4",
   },
   {
     id: "gemini-3.7-flash",
     label: "Gemini Flash 3.7",
     shortLabel: "Flash 3.7",
-    fallback: "3.6",
+    fallback: "3.6 → 3.5 → Gemma 4",
   },
   {
     id: "gemini-3.6-flash",
     label: "Gemini Flash 3.6",
     shortLabel: "Flash 3.6",
-    fallback: "none",
+    fallback: "3.5 → Gemma 4",
+  },
+  {
+    id: "gemini-3.5-flash",
+    label: "Gemini Flash 3.5",
+    shortLabel: "Flash 3.5",
+    fallback: "Gemma 4",
   },
 ] as const;
 
 export type AnalysisModel = (typeof ANALYSIS_MODELS)[number]["id"];
 export const DEFAULT_ANALYSIS_MODEL: AnalysisModel = "gemini-3.8-flash";
+
+export const ANSWER_MODELS = [
+  { id: "muse", label: "Muse Glimmer" },
+  { id: "nemotron", label: "Nemotron" },
+  { id: "gemma", label: "Gemma 4 31B" },
+] as const;
+export type AnswerModel = (typeof ANSWER_MODELS)[number]["id"];
+export const DEFAULT_ANSWER_MODEL: AnswerModel = "muse";
 
 export type PaperStatus = "queued" | "processing" | "ready" | "failed";
 

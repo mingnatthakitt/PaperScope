@@ -8,10 +8,10 @@ import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
-from paperscope.config import ANALYSIS_MODEL_FALLBACKS, analysis_model_chain, settings
+from paperscope.config import ANALYSIS_MODEL_FALLBACKS, GEMMA_MODEL, analysis_model_chain, settings
 from paperscope.models.tables import (
     IngestionJob,
     Paper,
@@ -24,7 +24,14 @@ from paperscope.models.tables import (
     PaperSection,
     PaperVisual,
 )
-from paperscope.processing.pdf import crop_normalized, detect_sections, extract_pages, render_pages, sanitize_pdf_text
+from paperscope.processing.pdf import (
+    PageText,
+    crop_normalized,
+    detect_sections,
+    extract_pages,
+    render_pages,
+    sanitize_pdf_text,
+)
 from paperscope.providers.embeddings import QwenEmbeddingProvider
 from paperscope.providers.gemini import GeminiDocumentAnalysisProvider
 from paperscope.schemas import DeepPaperAnalysis
@@ -80,7 +87,7 @@ def reconcile_graph(
         nodes.append(node.model_copy(update={"evidence_keys": list(dict.fromkeys(evidence_ids))}))
 
     if not nodes:
-        raise ValueError("Gemini returned a graph with no valid nodes")
+            raise ValueError("The document-analysis provider returned a graph with no valid nodes")
 
     edges: list[AnalysisGraphEdge] = []
     for edge in graph.edges:
@@ -181,7 +188,7 @@ class IngestionPipeline:
                 "requestedModel": metadata.get("analysisModel", _requested_analysis_model(paper)),
                 "model": metadata.get("analysisModelUsed", _requested_analysis_model(paper)),
                 "fallbackUsed": bool(metadata.get("analysisFallbackUsed", False)),
-                "promptVersion": settings.analysis_prompt_version,
+                "promptVersion": metadata.get("analysisPromptVersion", settings.analysis_prompt_version),
             },
         }
         manifest = settings.papers_root / paper.sha256 / "manifest.json"
@@ -350,7 +357,7 @@ class IngestionPipeline:
             stage = "analyzing"
 
         if stage == "analyzing":
-            self._update_job(job, "analyzing", 50, "Inspecting the native PDF with Gemini")
+            self._update_job(job, "analyzing", 50, "Analyzing the paper with the selected model and fallbacks")
             page_rows = list(self.session.scalars(select(PaperPage).where(PaperPage.paper_id == paper.id)).all())
             chunks = list(self.session.scalars(select(PaperChunk).where(PaperChunk.paper_id == paper.id).order_by(PaperChunk.chunk_index)).all())
             if not page_rows:
@@ -359,30 +366,68 @@ class IngestionPipeline:
             page_paths = {page.page_number: settings.papers_root / page.image_path for page in page_rows}
             requested_model = _requested_analysis_model(paper)
             model_chain = analysis_model_chain(requested_model)
+            prompt_versions = {
+                model: settings.gemma_analysis_prompt_version if model == GEMMA_MODEL else settings.analysis_prompt_version
+                for model in model_chain
+            }
             cached_rows = list(
                 self.session.scalars(
                     select(PaperAnalysis).where(
                         PaperAnalysis.paper_id == paper.id,
-                        PaperAnalysis.model.in_(model_chain),
-                        PaperAnalysis.prompt_version == settings.analysis_prompt_version,
+                        or_(
+                            *(
+                                and_(PaperAnalysis.model == model, PaperAnalysis.prompt_version == prompt_version)
+                                for model, prompt_version in prompt_versions.items()
+                            )
+                        ),
                     )
                 ).all()
             )
+            cached_by_key = {(row.model, row.prompt_version): row for row in cached_rows}
             analysis_row = next(
-                (row for model in model_chain for row in cached_rows if row.model == model),
+                (cached_by_key[(model, prompt_versions[model])] for model in model_chain if (model, prompt_versions[model]) in cached_by_key),
                 None,
             )
             if analysis_row:
-                logger.info("Reusing cached Gemini analysis for paper %s", paper.id)
+                logger.info("Reusing cached paper analysis for paper %s", paper.id)
                 analysis = DeepPaperAnalysis.model_validate(analysis_row.payload)
             else:
                 analysis_provider = GeminiDocumentAnalysisProvider(model=requested_model)
-                analysis = asyncio.run(analysis_provider.analyze_pdf(original))
+                page_texts = [
+                    PageText(page_number=page.page_number, text=page.text_content or "", blocks=[])
+                    for page in page_rows
+                ]
+
+                def report_gemma_progress(completed: int, total: int) -> None:
+                    progress = 50 + round(16 * completed / max(total, 1))
+                    self._update_job(
+                        job,
+                        "analyzing",
+                        progress,
+                        f"Gemma 4 is reviewing page batch {completed}/{total}",
+                    )
+
+                batch_cache_dir = (
+                    settings.papers_root
+                    / paper.sha256
+                    / "analysis-cache"
+                    / GEMMA_MODEL
+                    / re.sub(r"[^A-Za-z0-9_.-]+", "-", settings.gemma_analysis_prompt_version)
+                )
+                analysis = asyncio.run(
+                    analysis_provider.analyze_pdf(
+                        original,
+                        pages=page_texts,
+                        page_images=page_paths,
+                        batch_cache_dir=batch_cache_dir,
+                        progress_callback=report_gemma_progress,
+                    )
+                )
                 actual_model = analysis_provider.model_used
                 analysis_row = PaperAnalysis(
                     paper_id=paper.id,
                     model=actual_model,
-                    prompt_version=settings.analysis_prompt_version,
+                    prompt_version=prompt_versions[actual_model],
                     payload=analysis.model_dump(mode="json", by_alias=False),
                 )
                 self.session.add(analysis_row)
@@ -394,6 +439,7 @@ class IngestionPipeline:
                 "analysisModelUsed": actual_model,
                 "analysisFallbackUsed": actual_model != requested_model,
                 "analysisModelFallbackChain": list(model_chain),
+                "analysisPromptVersion": analysis_row.prompt_version,
             }
             if analysis.title:
                 paper.title = analysis.title

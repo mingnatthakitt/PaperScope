@@ -11,10 +11,12 @@ load_dotenv(_DOTENV_PATH)
 _CONFIG_ROOT = Path(_DOTENV_PATH).resolve().parent if _DOTENV_PATH else Path.cwd()
 
 DEFAULT_ANALYSIS_MODEL = "gemini-3.8-flash"
+GEMMA_MODEL = "gemma-4-31b-it"
 ANALYSIS_MODEL_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "gemini-3.8-flash": ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"),
-    "gemini-3.7-flash": ("gemini-3.7-flash", "gemini-3.6-flash"),
-    "gemini-3.6-flash": ("gemini-3.6-flash",),
+    "gemini-3.8-flash": ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", GEMMA_MODEL),
+    "gemini-3.7-flash": ("gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", GEMMA_MODEL),
+    "gemini-3.6-flash": ("gemini-3.6-flash", "gemini-3.5-flash", GEMMA_MODEL),
+    "gemini-3.5-flash": ("gemini-3.5-flash", GEMMA_MODEL),
 }
 
 
@@ -45,11 +47,13 @@ class Settings:
     rag_fallback_model: str = os.getenv(
         "RAG_FALLBACK_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     )
+    rag_gemma_model: str = os.getenv("RAG_GEMMA_MODEL", GEMMA_MODEL)
     rag_primary_max_retries: int = _int("RAG_PRIMARY_MAX_RETRIES", 2)
     rag_fallback_max_retries: int = _int("RAG_FALLBACK_MAX_RETRIES", 2)
+    rag_gemma_max_retries: int = _int("RAG_GEMMA_MAX_RETRIES", 1)
     rag_timeout_seconds: int = _int("RAG_TIMEOUT_SECONDS", 60)
     # Keep each upstream call bounded so a slow Muse request cannot consume the
-    # entire request budget and prevent the Nemotron fallback from running.
+    # entire request budget and prevent later answer providers from running.
     rag_provider_timeout_seconds: int = _int("RAG_PROVIDER_TIMEOUT_SECONDS", 18)
     circuit_breaker_failures: int = _int("RAG_CIRCUIT_BREAKER_FAILURES", 3)
     circuit_breaker_cooldown_seconds: int = _int("RAG_CIRCUIT_BREAKER_COOLDOWN_SECONDS", 90)
@@ -64,7 +68,13 @@ class Settings:
     max_pdf_pages: int = _int("MAX_PDF_PAGES", 200)
     render_dpi: int = _int("PDF_RENDER_DPI", 200)
     analysis_prompt_version: str = os.getenv("ANALYSIS_PROMPT_VERSION", "analysis-v1")
+    gemma_analysis_prompt_version: str = os.getenv(
+        "GEMMA_ANALYSIS_PROMPT_VERSION", "gemma-pages-v1"
+    )
     gemini_model_max_retries: int = _int("GEMINI_MODEL_MAX_RETRIES", 2)
+    gemma_analysis_max_retries: int = _int(
+        "GEMMA_ANALYSIS_MAX_RETRIES", _int("GEMINI_MODEL_MAX_RETRIES", 2)
+    )
     rag_prompt_version: str = os.getenv("RAG_PROMPT_VERSION", "rag-v1")
     rag_rate_limit_per_minute: int = _int("RAG_RATE_LIMIT_PER_MINUTE", 30)
     ingestion_max_attempts: int = _int("INGESTION_MAX_ATTEMPTS", 3)

@@ -9,6 +9,7 @@ import { demoPaper } from "@/lib/mock-data";
 import { cn, formatAuthors, formatPageCount } from "@/lib/utils";
 import { ANALYSIS_MODELS, type ConversationTurn, type EvidenceCitation, type ExplanationLevel, type PaperAnalysis, type PaperDetail, type VisualArtifact } from "@/lib/types";
 import { ConceptGraph } from "./concept-graph";
+import { AnswerModelSelector, useAnswerModel } from "./model-selection";
 
 type WorkspaceTab = "analysis" | "graph" | "visual" | "ask";
 type ReadyPaper = PaperDetail & {
@@ -21,6 +22,7 @@ function isReadyPaper(paper: PaperDetail): paper is ReadyPaper {
 }
 
 function analysisModelLabel(model: string | undefined) {
+  if (model === "gemma-4-31b-it") return "Gemma 4 31B";
   return ANALYSIS_MODELS.find((option) => option.id === model)?.label ?? model;
 }
 
@@ -248,6 +250,7 @@ function AnswerText({ content }: { content: string }) {
 }
 
 function AskView({ paperId, onCitation, suggestedQuestion }: { paperId: string; onCitation: (citation: EvidenceCitation) => void; suggestedQuestion?: string | null }) {
+  const { answerModel } = useAnswerModel();
   const [question, setQuestion] = useState(() => suggestedQuestion ?? "");
   const [messages, setMessages] = useState<ChatMessage[]>(() => readChat(paperId));
   const [loading, setLoading] = useState(false);
@@ -276,7 +279,7 @@ function AskView({ paperId, onCitation, suggestedQuestion }: { paperId: string; 
     setLoading(true);
     setError(null);
     try {
-      const result = await askPaper([paperId], trimmed, history);
+      const result = await askPaper([paperId], trimmed, history, answerModel);
       const userMessage: ChatMessage = { id: newChatMessageId(), role: "user", content: trimmed };
       const assistantMessage: ChatMessage = {
         id: newChatMessageId(),
@@ -316,7 +319,7 @@ function AskView({ paperId, onCitation, suggestedQuestion }: { paperId: string; 
 
   return (
     <div className="max-w-[820px]">
-      <div className="mb-6 flex items-start gap-3 border-b border-[var(--line)] pb-5"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] bg-[var(--accent-soft)] text-[var(--accent-strong)]"><Sparkle size={16} /></span><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center justify-between gap-3"><h2 className="text-[14px] font-semibold">Ask about this paper</h2><button type="button" onClick={clearChat} className="inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[var(--ink-muted)] transition hover:border-[var(--accent)] hover:text-[var(--accent-strong)]"><Plus size={12} /> New chat</button></div><p className="mt-1 text-[12px] leading-5 text-[var(--ink-muted)]">Follow up naturally. Your conversation is stored in this browser tab only and disappears when you start a new chat or close the tab.</p></div></div>
+      <div className="mb-6 flex items-start gap-3 border-b border-[var(--line)] pb-5"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] bg-[var(--accent-soft)] text-[var(--accent-strong)]"><Sparkle size={16} /></span><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center justify-between gap-3"><h2 className="text-[14px] font-semibold">Ask about this paper</h2><div className="flex flex-wrap items-center gap-3"><AnswerModelSelector /><button type="button" onClick={clearChat} className="inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[var(--ink-muted)] transition hover:border-[var(--accent)] hover:text-[var(--accent-strong)]"><Plus size={12} /> New chat</button></div></div><p className="mt-1 text-[12px] leading-5 text-[var(--ink-muted)]">Follow up naturally. Your conversation is stored in this browser tab only and disappears when you start a new chat or close the tab.</p></div></div>
       <div className="overflow-hidden rounded-[16px] border border-[var(--line)] bg-[var(--surface)]">
         <div ref={chatScrollRef} className="max-h-[520px] space-y-5 overflow-y-auto p-4 sm:p-5" aria-live="polite">
           {messages.length === 0 && !pendingQuestion && <div className="rounded-[12px] border border-dashed border-[var(--line-strong)] bg-[var(--canvas)] p-5"><p className="text-[13px] font-semibold">Start with a question</p><p className="mt-2 max-w-[560px] text-[12px] leading-5 text-[var(--ink-muted)]">Ask for the paper&apos;s intuition, a method detail, or what a figure actually shows. Follow-ups keep the conversation in context.</p><div className="mt-4 flex flex-wrap gap-2">{suggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => { void ask(suggestion); }} disabled={loading} className="rounded-full border border-[var(--line)] px-3 py-2 text-left text-[11px] text-[var(--ink-muted)] transition hover:border-[var(--accent)] hover:text-[var(--accent-strong)] disabled:cursor-wait disabled:opacity-50">{suggestion}</button>)}</div></div>}

@@ -1,6 +1,6 @@
 import { demoPaper } from "./mock-data";
 import { DEFAULT_ANALYSIS_MODEL } from "./types";
-import type { AnalysisModel, ConversationTurn, ExplanationLevel, JobStatus, PaperAnalysis, PaperDetail, RagAnswer, SearchResponse } from "./types";
+import type { AnalysisModel, AnswerModel, ConversationTurn, ExplanationLevel, JobStatus, PaperAnalysis, PaperDetail, RagAnswer, SearchResponse } from "./types";
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
@@ -82,12 +82,12 @@ export async function retryJob(jobId: string): Promise<{ paperId: string; jobId:
   });
 }
 
-export async function askPaper(paperIds: string[], question: string, history: ConversationTurn[] = []): Promise<RagAnswer> {
+export async function askPaper(paperIds: string[], question: string, history: ConversationTurn[] = [], answerModel: AnswerModel = "muse"): Promise<RagAnswer> {
   try {
     return await request<RagAnswer>("/v1/rag/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paperIds, question, explanationLevel: "student", history }),
+      body: JSON.stringify({ paperIds, question, explanationLevel: "student", history, answerModel }),
     });
   } catch (error) {
     if (paperIds.length !== 1 || !paperIds.includes("eagle-3")) throw error;

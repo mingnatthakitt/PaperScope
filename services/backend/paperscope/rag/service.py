@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
@@ -8,14 +9,18 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from paperscope.config import settings
+from paperscope.config import GEMMA_MODEL, settings
 from paperscope.models.tables import PaperPage, PaperVisual
 from paperscope.providers.contracts import ProviderConfigurationError, RetryableProviderError
 from paperscope.providers.embeddings import QwenEmbeddingProvider
+from paperscope.providers.gemma import Gemma4RAGProvider
 from paperscope.providers.nim import NimMuseProvider, NimNemotronProvider, citation_map
 from paperscope.rag.context import build_multimodal_context
 from paperscope.rag.retrieval import retrieve_all
 from paperscope.schemas import RAGAnswer, RAGModelInput, RAGRequest, RetrievedContext
+
+logger = logging.getLogger("paperscope.rag")
+DEFAULT_PROVIDER_ORDER = ("muse", "nemotron", "gemma")
 
 
 class CircuitBreaker:
@@ -61,6 +66,17 @@ class RagService:
             settings.circuit_breaker_failures,
             cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
         )
+        self.breakers = {
+            "muse": self.breaker,
+            "nemotron": CircuitBreaker(
+                settings.circuit_breaker_failures,
+                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+            ),
+            "gemma": CircuitBreaker(
+                settings.circuit_breaker_failures,
+                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+            ),
+        }
 
     def warm_embeddings(self) -> None:
         """Load Qwen in the API process before the first user query."""
@@ -90,66 +106,103 @@ class RagService:
             request.history,
         )
         records = self._citation_records(session, context)
-        primary_error: Exception | None = None
+        configured_order = [request.answer_model, *(key for key in DEFAULT_PROVIDER_ORDER if key != request.answer_model)]
+        provider_order = [
+            key
+            for key in configured_order
+            if (settings.nvidia_api_key and key in {"muse", "nemotron"})
+            or (settings.google_ai_api_key and key == "gemma")
+        ]
+        if not provider_order:
+            raise ProviderConfigurationError(
+                "Configure NVIDIA_API_KEY or GOOGLE_AI_API_KEY to enable paper answers"
+            )
+
+        available_order = []
+        for key in provider_order:
+            if await self.breakers[key].allow():
+                available_order.append(key)
+            else:
+                logger.warning("RAG provider %s circuit is open", key)
+        if not available_order:
+            raise RetryableProviderError("All configured RAG provider circuits are open")
+
+        retry_limits = {
+            "muse": settings.rag_primary_max_retries,
+            "nemotron": settings.rag_fallback_max_retries,
+            "gemma": settings.rag_gemma_max_retries,
+        }
+        last_error: Exception | None = None
         provider_timeout = float(settings.rag_provider_timeout_seconds)
-        # Keep a complete provider window available for Nemotron. Without this
-        # guard, the configured Muse retry count can spend all 60 seconds before
-        # the fallback is even constructed.
-        fallback_reserve = provider_timeout + 1.0
 
-        if await self.breaker.allow():
+        for index, provider_key in enumerate(available_order):
+            reserve = provider_timeout * (len(available_order) - index - 1) + 1.0
+            provider_deadline = deadline - reserve
+            if provider_deadline - time.monotonic() <= 0.25:
+                break
             try:
-                provider = NimMuseProvider()
-                for attempt in range(settings.rag_primary_max_retries + 1):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= provider_timeout + fallback_reserve:
-                        break
-                    try:
-                        result = await self._answer_with_deadline(provider, context, deadline)
-                        await self.breaker.success()
-                        return self._finalize(result.answer, result.model, False, records, started)
-                    except RetryableProviderError as exc:
-                        primary_error = exc
-                        await self.breaker.failure()
-                        if attempt < settings.rag_primary_max_retries:
-                            await asyncio.sleep(0.6 * (2**attempt))
-                        else:
-                            break
+                provider = self._provider(provider_key, provider_timeout)
             except ProviderConfigurationError as exc:
-                primary_error = exc
-        else:
-            primary_error = RetryableProviderError("Muse circuit is open")
+                last_error = exc
+                continue
 
-        fallback_error: RetryableProviderError | None = None
-        try:
-            fallback_provider = NimNemotronProvider()
-            for fallback_attempt in range(settings.rag_fallback_max_retries + 1):
-                try:
-                    fallback = await self._answer_with_deadline(fallback_provider, context, deadline)
-                    return self._finalize(fallback.answer, fallback.model, True, records, started)
-                except RetryableProviderError as exc:
-                    fallback_error = exc
-                    remaining = deadline - time.monotonic()
-                    if fallback_attempt < settings.rag_fallback_max_retries and remaining > provider_timeout + 1:
-                        await asyncio.sleep(0.8)
-                        continue
+            for attempt in range(retry_limits[provider_key] + 1):
+                if provider_deadline - time.monotonic() <= 0.25:
                     break
-        except ProviderConfigurationError:
-            raise primary_error or ProviderConfigurationError("No RAG provider configured")
-        if fallback_error:
-            raise fallback_error
-        raise primary_error or RetryableProviderError("No RAG provider returned an answer")
+                try:
+                    result = await self._answer_with_deadline(provider, context, provider_deadline)
+                    await self.breakers[provider_key].success()
+                    return self._finalize(
+                        result.answer,
+                        result.model,
+                        provider_key != request.answer_model,
+                        records,
+                        started,
+                    )
+                except ProviderConfigurationError as exc:
+                    last_error = exc
+                    logger.warning("RAG provider %s is not configured", provider_key)
+                    break
+                except RetryableProviderError as exc:
+                    last_error = exc
+                    await self.breakers[provider_key].failure()
+                    logger.warning("RAG provider %s attempt %s failed", provider_key, attempt + 1)
+                    if attempt < retry_limits[provider_key]:
+                        backoff = min(0.6 * (2**attempt), max(provider_deadline - time.monotonic(), 0))
+                        if backoff > 0:
+                            await asyncio.sleep(backoff)
+                except Exception as exc:
+                    last_error = exc
+                    await self.breakers[provider_key].failure()
+                    logger.warning(
+                        "RAG provider %s rejected the request: %s",
+                        provider_key,
+                        type(exc).__name__,
+                    )
+                    break
+
+        if last_error:
+            raise RetryableProviderError("All configured RAG providers failed after their retries") from last_error
+        raise RetryableProviderError("The RAG request ran out of time before a provider could answer")
+
+    @staticmethod
+    def _provider(provider_key: str, timeout_seconds: float):
+        if provider_key == "muse":
+            return NimMuseProvider(timeout_seconds=timeout_seconds)
+        if provider_key == "nemotron":
+            return NimNemotronProvider(timeout_seconds=timeout_seconds)
+        if provider_key == "gemma":
+            return Gemma4RAGProvider(model=settings.rag_gemma_model or GEMMA_MODEL, timeout_seconds=timeout_seconds)
+        raise ProviderConfigurationError("Unknown RAG provider selection")
 
     @staticmethod
     async def _answer_with_deadline(provider, context: RAGModelInput, deadline: float) -> RAGAnswer:
-        """Run one provider call without starving the configured fallback."""
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        """Run a provider call within its reserved slice of the request deadline."""
+        timeout = min(float(settings.rag_provider_timeout_seconds), deadline - time.monotonic())
+        if timeout <= 0.25:
             raise RetryableProviderError(f"RAG time budget exhausted before calling {provider.model}")
-
-        timeout = min(float(settings.rag_provider_timeout_seconds), remaining)
-        if remaining < float(settings.rag_provider_timeout_seconds):
-            raise RetryableProviderError(f"RAG time budget is too small to call {provider.model}")
+        if hasattr(provider, "timeout_seconds"):
+            provider.timeout_seconds = timeout
         try:
             # The OpenAI-compatible client owns the socket timeout. Do not wrap
             # its thread-backed call in wait_for at the same deadline: cancelling
